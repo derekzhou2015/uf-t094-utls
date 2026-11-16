@@ -18,6 +18,7 @@ import (
 	"math/rand"
 	"sort"
 	"strconv"
+	"time"
 
 	"github.com/refraction-networking/utls/dicttls"
 )
@@ -3015,43 +3016,80 @@ func utlsIdToSpec(id ClientHelloID) (ClientHelloSpec, error) {
 	}
 }
 
-// ShuffleChromeTLSExtensions shuffles the extensions in the ClientHelloSpec to avoid ossification.
-// It shuffles every extension except GREASE, padding and pre_shared_key extensions.
+// isChromeShufflePinned reports whether the extension at idx must keep its
+// absolute position during a Chrome-style extension shuffle. GREASE, padding
+// and pre_shared_key extensions are positionally invariant: their wire
+// positions carry semantics (e.g. pre_shared_key must be last) and real Chrome
+// never moves them.
+func isChromeShufflePinned(idx int, exts []TLSExtension) bool {
+	switch exts[idx].(type) {
+	case *UtlsGREASEExtension, *UtlsPaddingExtension, PreSharedKeyExtension:
+		return true
+	default:
+		return false
+	}
+}
+
+// shuffleChromeTLSExtensionsWithRand is the testable core of
+// ShuffleChromeTLSExtensions. It permutes the non-pinned extensions uniformly
+// at random while leaving pinned extensions at their original positions.
+//
+// Uniformity is achieved by running an unbiased Fisher-Yates shuffle over the
+// movable extensions only: the movable extensions are treated as a standalone
+// sequence of length n, every one of the n! permutations is produced with
+// probability 1/n!, and the result is written back into the movable slots in
+// order. Consequently each movable extension lands in each movable slot with
+// probability 1/n. Pinned slots are never touched and play no part in the
+// permutation.
+//
+// Running Fisher-Yates over the whole slice and skipping swaps that touch a
+// pinned slot does NOT give this guarantee: a skipped swap biases the element
+// toward its current slot, and the bias differs from slot to slot, which is a
+// statistically observable fingerprint.
+func shuffleChromeTLSExtensionsWithRand(exts []TLSExtension, r *rand.Rand) []TLSExtension {
+	// Record the movable slots and pull the movable extensions out so the
+	// pinned extensions are completely excluded from the permutation.
+	movable := make([]TLSExtension, 0, len(exts))
+	movableSlots := make([]int, 0, len(exts))
+	for idx, ext := range exts {
+		if isChromeShufflePinned(idx, exts) {
+			continue
+		}
+		movable = append(movable, ext)
+		movableSlots = append(movableSlots, idx)
+	}
+
+	// Unbiased Fisher-Yates over the movable subsequence.
+	r.Shuffle(len(movable), func(i, j int) {
+		movable[i], movable[j] = movable[j], movable[i]
+	})
+
+	for i, slot := range movableSlots {
+		exts[slot] = movable[i]
+	}
+	return exts
+}
+
+// ShuffleChromeTLSExtensions shuffles the extensions in the ClientHelloSpec to
+// avoid ossification.
+// It shuffles every extension except GREASE, padding and pre_shared_key
+// extensions, which remain pinned at their original positions. The movable
+// extensions are permuted uniformly: each movable extension is equally likely
+// to end up in any movable slot, matching the uniform distribution produced by
+// real Chrome.
 //
 // This feature was first introduced by Chrome 106.
 func ShuffleChromeTLSExtensions(exts []TLSExtension) []TLSExtension {
-	// unshufCheck checks if the exts[idx] is a GREASE/padding/pre_shared_key extension,
-	// and returns true on success. For these extensions are considered positionally invariant.
-	var skipShuf = func(idx int, exts []TLSExtension) bool {
-		switch exts[idx].(type) {
-		case *UtlsGREASEExtension, *UtlsPaddingExtension, PreSharedKeyExtension:
-			return true
-		default:
-			return false
-		}
-	}
-
-	// Shuffle other extensions
+	var r *rand.Rand
 	randInt64, err := crand.Int(crand.Reader, big.NewInt(math.MaxInt64))
 	if err != nil {
 		// warning: random could be deterministic
-		rand.Shuffle(len(exts), func(i, j int) {
-			if skipShuf(i, exts) || skipShuf(j, exts) {
-				return // do not shuffle some of the extensions
-			}
-			exts[i], exts[j] = exts[j], exts[i]
-		})
+		r = rand.New(rand.NewSource(time.Now().UnixNano()))
 		fmt.Println("Warning: failed to use a cryptographically secure random number generator. The shuffle can be deterministic.")
 	} else {
-		rand.New(rand.NewSource(randInt64.Int64())).Shuffle(len(exts), func(i, j int) {
-			if skipShuf(i, exts) || skipShuf(j, exts) {
-				return // do not shuffle some of the extensions
-			}
-			exts[i], exts[j] = exts[j], exts[i]
-		})
+		r = rand.New(rand.NewSource(randInt64.Int64()))
 	}
-
-	return exts
+	return shuffleChromeTLSExtensionsWithRand(exts, r)
 }
 
 func (uconn *UConn) applyPresetByID(id ClientHelloID) (err error) {
